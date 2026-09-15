@@ -4,11 +4,16 @@
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s Tests -v
 bash build.sh
 "../Codex Dial.app/Contents/MacOS/CodexDial" --self-test
+"../Codex Dial.app/Contents/MacOS/CodexDial" --hud-self-test
 "../Codex Dial.app/Contents/MacOS/CodexDial" --render /tmp/dial-previews
 ```
 
 Python tests use a temporary socket and synthetic app bundles; they do not touch
 real Codex sessions. Swift checks use preview state and temporary preset files.
+HUD checks cover verified old text, scramble endpoints, success-only checks,
+cancellation, reduced motion, and a 1.5-second hold after the check finishes.
+First-time builds need the [publisher signing setup](../docs/SIGNING.md), or an
+explicit `CODEXDIAL_ADHOC=1` for a disposable preview.
 
 The desktop adapter opens a connection only for an explicit action, discovers
 that session's owner, follows its state, and closes the connection afterward.

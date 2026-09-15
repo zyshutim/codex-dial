@@ -179,14 +179,15 @@ final class CodexBridge {
             DispatchQueue.main.async { completion(result) }
         }
     }
-    func apply(_ selection: Selection, models: [ModelOption], completion: @escaping (Result<Reading, Error>) -> Void) {
+    func apply(_ selection: Selection, models: [ModelOption], prepared: ((Reading) -> Void)? = nil, completion: @escaping (Result<Reading, Error>) -> Void) {
         queue.async {
             let result: Result<Reading, Error> = Result {
                 if let error = Validation.selection(selection, models: models) { throw Failure(message: error) }
                 let automatic = self.path == "desktop" && self.threadID.isEmpty
                 let focus = automatic ? try CurrentThreadLink.capture() : nil
                 if let focus { self.resolvedThreadID = focus.id; self.title = String(focus.id.prefix(8)) }
-                _ = try self.current(resolveActive: false)
+                let previous = try self.current(resolveActive: false)
+                DispatchQueue.main.async { prepared?(previous) }
                 let target = self.resolvedThreadID
                 if let focus {
                     // Re-resolve after IPC loading: navigation within the same window

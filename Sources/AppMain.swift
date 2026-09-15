@@ -5,6 +5,11 @@ import Combine
 @main struct CodexDialMain {
     @MainActor static func main() {
         if CommandLine.arguments.contains("--self-test") { SelfTests.run(); return }
+        if CommandLine.arguments.contains("--hud-self-test") {
+            let app = NSApplication.shared
+            Task { @MainActor in await HUDChecks.run(); app.terminate(nil) }
+            app.run(); return
+        }
         if CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--rpc-self-test" {
             RPCSelfTest.run(path: CommandLine.arguments[2], threadID: CommandLine.arguments[3]); return
         }
@@ -24,6 +29,7 @@ final class HUDPanel: NSPanel {
     private var item: NSStatusItem!
     private let popover = NSPopover()
     private var hudPanel: HUDPanel?
+    private let hudPresentation = HUDPresentation()
     private var previewWindow: NSWindow?
     private var hideWork: DispatchWorkItem?
     private var subscriptions = Set<AnyCancellable>()
@@ -65,7 +71,7 @@ final class HUDPanel: NSPanel {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.showPopover() }
         }
     }
-    func applicationWillTerminate(_ notification: Notification) { state?.stop() }
+    func applicationWillTerminate(_ notification: Notification) { hudPresentation.dismiss(); state?.stop() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { state?.preview == true }
     private func updateStatus() {
         item.button?.title = " " + state.statusTitle
@@ -77,21 +83,23 @@ final class HUDPanel: NSPanel {
     }
     private func showPopover() {
         guard let button = item.button else { return }
-        hudPanel?.orderOut(nil); hideWork?.cancel()
+        hudPanel?.orderOut(nil); hideWork?.cancel(); hudPresentation.dismiss()
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
     }
     func popoverDidClose(_ notification: Notification) { state.closePanel() }
     private func presentHUD(_ message: HUDMessage) {
-        hideWork?.cancel()
-        let size = NSSize(width: 265, height: message.phase == .failure ? 142 : 112)
+        if hudPresentation.operationID != message.id || message.phase == .switching { hideWork?.cancel() }
+        let size = HUDPresentation.size
         let panel = hudPanel ?? HUDPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isFloatingPanel = true; panel.level = .statusBar
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
         panel.hidesOnDeactivate = false; panel.ignoresMouseEvents = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        panel.contentView = NSHostingView(rootView: SwitchHUD(message: message, model: state.model(message.preset.selection)))
+        if panel.contentView == nil || hudPanel == nil {
+            panel.contentView = NSHostingView(rootView: SwitchHUD(presentation: hudPresentation))
+        }
         let anchor = item.button.flatMap { button -> NSRect? in button.window?.convertToScreen(button.convert(button.bounds, to: nil)) }
         let screen = NSScreen.screens.first(where: { $0.frame.contains(anchor?.origin ?? NSEvent.mouseLocation) }) ?? NSScreen.main!
         let bounds = screen.visibleFrame
@@ -99,11 +107,17 @@ final class HUDPanel: NSPanel {
         let y = min(anchor?.minY ?? bounds.maxY, bounds.maxY) - size.height - 12
         panel.setFrame(NSRect(x: x, y: max(bounds.minY + 12, y), width: size.width, height: size.height), display: true)
         panel.orderFrontRegardless(); hudPanel = panel
-        if message.phase != .switching {
-            let work = DispatchWorkItem { [weak panel] in panel?.orderOut(nil) }
-            hideWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + (message.phase == .failure ? 4 : 0.75), execute: work)
+        hudPresentation.onSettled = { [weak self, weak panel] id, delay in
+            guard let self else { return }
+            self.hideWork?.cancel()
+            let work = DispatchWorkItem { [weak self, weak panel] in
+                guard let self, self.hudPresentation.operationID == id else { return }
+                panel?.orderOut(nil); self.hudPresentation.dismiss()
+            }
+            self.hideWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
+        hudPresentation.receive(message, models: state.models, reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
     }
     private func renderArtifacts() {
         guard let index = CommandLine.arguments.firstIndex(of: "--render"), index + 1 < CommandLine.arguments.count else { return }
@@ -120,8 +134,14 @@ final class HUDPanel: NSPanel {
             try render(ShortcutSettings(state: state, recorder: state.recorder).frame(width: 420, height: 730).background(.regularMaterial), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("06-recording-dark.png"), dark: true)
             state.recorder.stop()
             try render(PresetEditor(state: state, preset: state.presets[2], dismiss: {}), size: NSSize(width: 370, height: 535), to: directory.appendingPathComponent("03-editor.png"))
-            let message = HUDMessage(preset: state.presets[2], phase: .success, detail: "预览切换 · 未改变 Codex")
-            try render(SwitchHUD(message: message, model: state.model(message.preset.selection)), size: NSSize(width: 265, height: 112), to: directory.appendingPathComponent("04-switch.png"))
+            let presentation = HUDPresentation()
+            presentation.previewFrame(from: state.presets[1].selection!, to: state.presets[2].selection!, preset: state.presets[2], elapsed: 1, models: state.models)
+            try render(SwitchHUD(presentation: presentation), size: HUDPresentation.size, to: directory.appendingPathComponent("04-switch.png"))
+            for frame in 0..<66 {
+                presentation.previewFrame(from: state.presets[1].selection!, to: state.presets[2].selection!, preset: state.presets[2], elapsed: Double(frame) / 30, models: state.models)
+                try render(SwitchHUD(presentation: presentation), size: HUDPresentation.size,
+                           to: directory.appendingPathComponent(String(format: "hud-%03d.png", frame)), dark: true)
+            }
             state.showSettings = false
             state.reading = CodexBridge.failureReading(CodexBridge.Failure(message: "Codex 设置接口已变化，无法确认参数兼容，尚未更改会话。", code: "incompatible"))
             try render(RootView(state: state), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("07-error-dark.png"), dark: true)

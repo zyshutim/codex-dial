@@ -19,13 +19,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>dev.local.codexdial</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.4.10</string>
-<key>CFBundleVersion</key><string>15</string>
+<key>CFBundleShortVersionString</key><string>0.4.11</string>
+<key>CFBundleVersion</key><string>16</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAccessibilityUsageDescription</key><string>通过当前 Codex 窗口的会话链接识别目标，切换你保存的模型和思考深度。</string>
 </dict></plist>
 PLIST
-/usr/bin/codesign --force --sign - --identifier dev.local.codexdial "$APP_DIR"
+/usr/bin/python3 "$SOURCE_DIR/Scripts/sign_app.py" --sign "$APP_DIR"
 echo "Built: $APP_DIR"

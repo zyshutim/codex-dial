@@ -8,6 +8,8 @@ struct HUDMessage: Equatable {
     var preset: Preset
     var phase: HUDPhase
     var detail: String
+    var id = UUID()
+    var previous: Selection? = nil
 }
 
 @MainActor final class AppState: ObservableObject {
@@ -147,25 +149,32 @@ struct HUDMessage: Equatable {
             hud = HUDMessage(preset: preset, phase: .failure, detail: message); return
         }
         busy = true; hotkeys.unregister(); onApply?()
-        hud = HUDMessage(preset: preset, phase: .switching, detail: "正在更新目标会话…")
+        let operationID = UUID()
+        hud = HUDMessage(preset: preset, phase: .switching, detail: "正在读取当前档位…", id: operationID)
         if preview {
+            hud?.previous = reading.selection
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
                 guard let self else { return }
                 self.reading = Reading(selection: selection, message: "界面预览", detail: "演示数据 · 不连接 Codex")
-                self.busy = false; self.hud = HUDMessage(preset: preset, phase: .success, detail: "预览切换 · 未改变 Codex")
+                self.busy = false
+                self.hud?.phase = .success; self.hud?.detail = "预览切换 · 未改变 Codex"
             }
             return
         }
-        bridge.apply(selection, models: models) { [weak self] result in
+        bridge.apply(selection, models: models, prepared: { [weak self] previous in
+            guard let self, self.hud?.id == operationID else { return }
+            self.hud?.previous = previous.selection
+            self.hud?.detail = "正在切换…"
+        }) { [weak self] result in
             guard let self else { return }
             self.busy = false
             switch result {
             case .success(let value):
                 self.reading = value
-                self.hud = HUDMessage(preset: preset, phase: .success, detail: "已更新会话的后续轮次设置")
+                self.hud?.phase = .success; self.hud?.detail = "已更新会话的后续轮次设置"
             case .failure(let failure):
                 self.reading = CodexBridge.failureReading(failure)
-                self.hud = HUDMessage(preset: preset, phase: .failure, detail: failure.localizedDescription)
+                self.hud?.phase = .failure; self.hud?.detail = failure.localizedDescription
             }
             self.updateHotkeys()
         }

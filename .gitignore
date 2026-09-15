@@ -5,3 +5,9 @@ __pycache__/
 *.pyc
 *.app/
 *.zip
+*.p12
+*.pfx
+*.keychain-db
+*.key
+*.pem
+keychain-password

@@ -426,35 +426,3 @@ struct ShortcutSettings: View {
         return recorder.symbols.isEmpty ? "按下组合键…" : recorder.symbols + "…"
     }
 }
-
-struct SwitchHUD: View {
-    let message: HUDMessage
-    let model: ModelOption?
-    private var color: Color { message.phase == .failure ? Color(nsColor: .systemRed) : DialStyle.accent }
-    var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Text(message.preset.digit)
-                .font(.system(size: 17, weight: .medium, design: .monospaced))
-                .foregroundStyle(color).frame(width: 29, height: 29)
-                .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 7))
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 5) {
-                    if message.phase == .switching { ProgressView().controlSize(.small) }
-                    else { Image(systemName: message.phase == .success ? "checkmark.circle.fill" : "exclamationmark.circle.fill").foregroundStyle(color) }
-                    Text(message.phase == .switching ? "正在切换" : message.phase == .success ? message.preset.title : "切换未完成")
-                        .font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Text(model?.shortName ?? message.preset.selection?.modelID ?? "未设置")
-                    .font(.system(size: 17, weight: .medium)).lineLimit(1).minimumScaleFactor(0.7)
-                Text(message.preset.selection?.effort.label ?? "—")
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(color).lineLimit(1)
-                if message.phase == .failure {
-                    Text(message.detail).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(3)
-                }
-            }.frame(maxWidth: .infinity, alignment: .leading)
-        }.padding(16).frame(width: 265, height: message.phase == .failure ? 142 : 112, alignment: .topLeading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 13))
-            .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(DialStyle.border, lineWidth: 0.5))
-            .accessibilityElement(children: .combine)
-    }
-}
