@@ -86,13 +86,14 @@ final class CodexBridge {
         var bytes = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": params]); bytes.append(10)
         do { try input?.write(contentsOf: bytes) }
         catch { disconnect(); throw Failure(message: "RPC 连接已断开，请重新连接。") }
-        let deadline = Date().addingTimeInterval(15)
+        let timeout: TimeInterval = method == "thread/read" ? 25 : 15
+        let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         while replies[id] == nil && !ended && Date() < deadline { _ = condition.wait(until: deadline) }
         let reply = replies.removeValue(forKey: id); let diagnostic = startupError; let stage = transportStage; condition.unlock()
         guard let reply else {
             disconnect()
-            throw Failure(message: diagnostic.isEmpty ? "超过 15 秒未收到回应，停在：\(stage)。" : "桌面连接启动失败：\(diagnostic)")
+            throw Failure(message: diagnostic.isEmpty ? "超过 \(Int(timeout)) 秒未收到回应，停在：\(stage)。" : "桌面连接启动失败：\(diagnostic)")
         }
         if let error = reply["error"] as? [String: Any] { throw Failure(message: error["message"] as? String ?? "RPC 请求失败") }
         return reply["result"] as? [String: Any] ?? [:]

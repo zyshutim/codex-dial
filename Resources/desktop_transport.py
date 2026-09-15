@@ -75,9 +75,11 @@ def resolve_title(p):
                 matches[tid]={'id':tid,'title':title}
     if len(matches)!=1:raise RuntimeError('当前项标题未匹配到唯一会话，暂不切换。')
     return next(iter(matches.values()))
+class ConnectionFailure(RuntimeError):pass
 class Desktop:
-    def __init__(self):self.pending={};self.client='initializing-client';self.states={};self.owner=None;self.following=None
+    def __init__(self):self.pending={};self.client='initializing-client';self.states={};self.owner=None;self.following=None;self.read_error=None
     async def connect(self):
+        self.client='initializing-client';self.read_error=None;self.owner=None;self.following=None;self.states.clear()
         paths=[CODEX_DIR/'ipc/ipc.sock',pathlib.Path('/private/tmp/codex-ipc')/('ipc-'+str(os.getuid())+'.sock')]
         failures=[]
         for p in paths:
@@ -94,11 +96,17 @@ class Desktop:
     async def send(self,m):
         b=json.dumps(m).encode();self.w.write(struct.pack('<I',len(b))+b);await self.w.drain()
     async def request(self,method,params,target=None,version=1):
+        if self.read_error is not None:raise ConnectionFailure('桌面连接已断开：'+str(self.read_error))
         rid=str(uuid.uuid4());f=asyncio.get_running_loop().create_future();self.pending[rid]=f
         m={'type':'request','requestId':rid,'sourceClientId':self.client,'method':method,'params':params,'version':version,'timeoutMs':5000}
         if target:m['targetClientId']=target
-        await self.send(m)
-        try:r=await asyncio.wait_for(f,6)
+        try:
+            await self.send(m)
+            r=await asyncio.wait_for(f,6)
+        except asyncio.TimeoutError as e:
+            raise ConnectionFailure('桌面请求超时：'+method) from e
+        except (OSError,asyncio.IncompleteReadError) as e:
+            raise ConnectionFailure('桌面连接中断：'+method) from e
         finally:self.pending.pop(rid,None)
         if r.get('resultType')!='success':raise RuntimeError('桌面接口未完成请求：'+str(r.get('error','unknown')))
         return r
@@ -132,11 +140,13 @@ class Desktop:
                             elif path==['latestReasoningEffort'] or path==['latestThreadSettings','effort']:state['reasoningEffort']=v
                             elif path==['latestThreadSettings'] and isinstance(v,dict):state.update(model=v.get('model'),reasoningEffort=v.get('effort'))
         except Exception as error:
+            self.read_error=error
+            self.states.clear()
             for f in self.pending.values():
-                if not f.done():f.set_exception(error)
+                if not f.done():f.set_exception(ConnectionFailure('桌面接收连接中断：'+type(error).__name__))
     async def state(self,tid):
         r=await self.request('thread-owner-discovery',{'hostId':'local','conversationId':tid});owner=r['handledByClientId']
-        if self.following!=tid or self.owner!=owner:
+        if self.following!=tid or self.owner!=owner or tid not in self.states:
             if self.following:
                 await self.broadcast('thread-stream-following-changed',{'hostId':'local','conversationId':self.following,'following':False},self.owner)
             self.following=tid;self.owner=owner;self.states.clear()
@@ -155,7 +165,13 @@ class Desktop:
             return await asyncio.to_thread(resolve_title,p)
         tid=p['threadId']
         if method=='thread/read':
-            state=await self.state(tid);return {'thread':dict(state,id=tid,status={'type':'idle'})}
+            try:state=await self.state(tid)
+            except ConnectionFailure:
+                # Only retry reads. A timed-out settings update may already have applied.
+                print(json.dumps({'method':'transport/stage','stage':'读取连接失效，自动重连'}),flush=True)
+                await self.close();await self.connect()
+                state=await self.state(tid)
+            return {'thread':dict(state,id=tid,status={'type':'idle'})}
         if method=='thread/settings/update':
             await self.state(tid)
             await self.request('thread-follower-update-thread-settings',{'conversationId':tid,'threadSettings':{'model':p['model'],'effort':p['effort']}},target=self.owner)
@@ -169,7 +185,12 @@ class Desktop:
         if self.following:
             try:await self.broadcast('thread-stream-following-changed',{'hostId':'local','conversationId':self.following,'following':False},self.owner)
             except:pass
-        self.w.close();await self.w.wait_closed();self.task.cancel()
+        self.w.close()
+        self.task.cancel()
+        try:await self.task
+        except (Exception,asyncio.CancelledError):pass
+        try:await asyncio.wait_for(self.w.wait_closed(),.5)
+        except (Exception,asyncio.CancelledError):pass
 async def main():
     d=Desktop()
     try:
