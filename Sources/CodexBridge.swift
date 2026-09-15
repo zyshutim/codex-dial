@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 struct RPCTarget: Identifiable {
     var id: String
@@ -11,7 +12,25 @@ final class CodexBridge {
     static let bundleID = "com.openai.codex"
     struct Failure: LocalizedError {
         let message: String
+        var code: String = "request_failed"
         var errorDescription: String? { message }
+        var title: String {
+            switch code {
+            case "session_missing": return "未识别到当前会话"
+            case "permission": return "需要辅助功能权限"
+            case "disconnected": return "Codex 连接已断开"
+            case "owner_missing": return "会话连接不可用"
+            case "timeout": return "Codex 响应超时"
+            case "state_timeout": return "档位读取超时"
+            case "incompatible": return "Codex 接口不兼容"
+            case "unconfirmed": return "切换结果待确认"
+            case "not_applied": return "档位未应用"
+            default: return "操作未完成"
+            }
+        }
+    }
+    static func failureReading(_ error: Error) -> Reading {
+        Reading(selection: nil, message: (error as? Failure)?.title ?? "操作未完成", detail: error.localizedDescription)
     }
     let queue = DispatchQueue(label: "CodexDial.rpc")
     var onChange: (() -> Void)?
@@ -28,6 +47,7 @@ final class CodexBridge {
     private var ended = false
     private var startupError = ""
     private var transportStage = "启动传输进程"
+    private var appPath = ""
 
     func configure(path: String, threadID: String, title: String) {
         queue.async {
@@ -43,6 +63,8 @@ final class CodexBridge {
         condition.lock(); generation += 1; ended = true; replies.removeAll(); condition.broadcast(); condition.unlock()
     }
     private func connect() throws {
+        let installedPath = NSRunningApplication.runningApplications(withBundleIdentifier: Self.bundleID).first?.bundleURL?.path ?? ""
+        if installedPath != appPath { disconnect(); appPath = installedPath }
         if process?.isRunning == true { return }
         guard path == "desktop" || (path.hasPrefix("/") && !path.hasSuffix("/ipc/ipc.sock")) else {
             throw Failure(message: "需要 app-server 的 Unix socket 地址；桌面私有 ipc.sock 不是这个协议。")
@@ -52,6 +74,10 @@ final class CodexBridge {
         let p = Process(), stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = [helper.path, path]
+        var environment = ProcessInfo.processInfo.environment
+        if !appPath.isEmpty { environment["CODEX_APP_PATH"] = appPath }
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        p.environment = environment
         p.standardInput = stdin; p.standardOutput = stdout; p.standardError = stderr
         condition.lock(); ended = false; startupError = ""; let epoch = generation; condition.unlock()
         try p.run(); process = p; input = stdin.fileHandleForWriting
@@ -85,17 +111,20 @@ final class CodexBridge {
         try connect(); nextID += 1; let id = nextID
         var bytes = try JSONSerialization.data(withJSONObject: ["id": id, "method": method, "params": params]); bytes.append(10)
         do { try input?.write(contentsOf: bytes) }
-        catch { disconnect(); throw Failure(message: "RPC 连接已断开，请重新连接。") }
-        let timeout: TimeInterval = method == "thread/read" ? 25 : 15
+        catch { disconnect(); throw Failure(message: "连接已断开，请重新读取。", code: "disconnected") }
+        let timeout: TimeInterval = method == "desktop/list" ? 15 : 30
         let deadline = Date().addingTimeInterval(timeout)
         condition.lock()
         while replies[id] == nil && !ended && Date() < deadline { _ = condition.wait(until: deadline) }
         let reply = replies.removeValue(forKey: id); let diagnostic = startupError; let stage = transportStage; condition.unlock()
         guard let reply else {
             disconnect()
-            throw Failure(message: diagnostic.isEmpty ? "超过 \(Int(timeout)) 秒未收到回应，停在：\(stage)。" : "桌面连接启动失败：\(diagnostic)")
+            if method == "thread/settings/update" {
+                throw Failure(message: "未收到切换确认，设置可能已生效。请重新读取；不会重复发送切换。停在：\(stage)。", code: "unconfirmed")
+            }
+            throw Failure(message: diagnostic.isEmpty ? "超过 \(Int(timeout)) 秒未收到回应，停在：\(stage)。" : "桌面连接启动失败：\(diagnostic)", code: diagnostic.isEmpty ? "timeout" : "disconnected")
         }
-        if let error = reply["error"] as? [String: Any] { throw Failure(message: error["message"] as? String ?? "RPC 请求失败") }
+        if let error = reply["error"] as? [String: Any] { throw Failure(message: error["message"] as? String ?? "请求失败", code: error["code"] as? String ?? "request_failed") }
         return reply["result"] as? [String: Any] ?? [:]
     }
     private func current(resolveActive: Bool = true) throws -> Reading {
@@ -105,16 +134,16 @@ final class CodexBridge {
             resolvedThreadID = focus.id
             title = String(focus.id.prefix(8))
         }
-        guard !resolvedThreadID.isEmpty else { throw Failure(message: "请先选择目标会话。") }
+        guard !resolvedThreadID.isEmpty else { throw Failure(message: "请打开目标 Codex 会话后重新读取。", code: "session_missing") }
         let result = try request("thread/read", ["threadId": resolvedThreadID, "includeTurns": false])
         guard let thread = result["thread"] as? [String: Any],
               let status = thread["status"] as? [String: Any], status["type"] as? String != "notLoaded" else {
-            throw Failure(message: "目标会话未在这个服务中加载，已停止切换。")
+            throw Failure(message: "目标会话未在这个服务中加载，已停止切换。", code: "owner_missing")
         }
         guard let model = thread["model"] as? String, let effort = thread["reasoningEffort"] as? String, let value = Effort(rawValue: effort) else {
-            return Reading(selection: nil, message: "\(threadID.isEmpty ? "当前窗口" : "固定会话") · \(title)", detail: "服务未返回完整档位；可应用一个预设。", connected: true)
+            throw Failure(message: "Codex 未返回可识别的模型与思考深度，尚未更改会话。", code: "incompatible")
         }
-        return Reading(selection: Selection(modelID: model, effort: value), message: "\(threadID.isEmpty ? "当前窗口" : "固定会话") · \(title)", detail: "后续轮次设置 · \(resolvedThreadID)", connected: true)
+        return Reading(selection: Selection(modelID: model, effort: value), message: "\(threadID.isEmpty ? "上次读取 · 当前窗口" : "固定会话 · " + title)", detail: "上次确认的后续轮次档位。每次切换时重新识别目标。", connected: true)
     }
     func list(completion: @escaping (Result<[RPCTarget], Error>) -> Void) {
         queue.async {
@@ -146,7 +175,7 @@ final class CodexBridge {
         queue.async {
             let result: Reading
             do { result = try self.current() }
-            catch { result = Reading(selection: nil, message: "RPC 未就绪", detail: error.localizedDescription) }
+            catch { result = Self.failureReading(error) }
             DispatchQueue.main.async { completion(result) }
         }
     }
@@ -164,11 +193,13 @@ final class CodexBridge {
                     // must not silently switch the previously viewed conversation.
                     let latest = try CurrentThreadLink.capture()
                     try focus.checkWindow()
-                    guard latest.id == target else { throw Failure(message: "会话已改变，已停止切换。") }
+                    guard latest.id == target else { throw Failure(message: "会话已改变，已停止切换。", code: "session_missing") }
                 }
                 _ = try self.request("thread/settings/update", ["threadId": target, "model": selection.modelID, "effort": selection.effort.rawValue])
-                let actual = try self.current(resolveActive: false)
-                guard self.resolvedThreadID == target, actual.selection == selection else { throw Failure(message: "服务已接受更新，但读回值不一致。请重新读取；设置可能已经改变。") }
+                let actual: Reading
+                do { actual = try self.current(resolveActive: false) }
+                catch { throw Failure(message: "切换已发送，但重新读取失败：\(error.localizedDescription) 设置可能已生效。", code: "unconfirmed") }
+                guard self.resolvedThreadID == target, actual.selection == selection else { throw Failure(message: "服务已接受更新，但读回值不一致。请重新读取；设置可能已经改变。", code: "unconfirmed") }
                 return actual
             }
             DispatchQueue.main.async { completion(result) }

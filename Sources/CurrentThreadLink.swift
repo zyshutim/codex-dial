@@ -13,7 +13,7 @@ struct CurrentThreadLink {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(root, kAXFocusedWindowAttribute as CFString, &value) == .success,
               let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-            throw CodexBridge.Failure(message: "未找到当前 Codex 窗口。")
+            throw CodexBridge.Failure(message: "未找到当前 Codex 窗口。", code: "session_missing")
         }
         return value as! AXUIElement
     }
@@ -21,13 +21,13 @@ struct CurrentThreadLink {
     func checkWindow() throws {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
               CFEqual(try Self.focusedWindow(pid), window) else {
-            throw CodexBridge.Failure(message: "当前窗口已改变，已停止切换。")
+            throw CodexBridge.Failure(message: "当前窗口已改变，已停止切换。", code: "session_missing")
         }
     }
 
     static func capture() throws -> CurrentThreadLink {
         guard AXIsProcessTrusted() else {
-            throw CodexBridge.Failure(message: "请允许 Codex Dial 的辅助功能权限，以获取当前会话链接。")
+            throw CodexBridge.Failure(message: "请允许 Codex Dial 的辅助功能权限，以获取当前会话链接。", code: "permission")
         }
         // Clicking the menu-bar panel can temporarily activate Dial.
         if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Bundle.main.bundleIdentifier,
@@ -39,7 +39,7 @@ struct CurrentThreadLink {
             }
         }
         guard let app = NSWorkspace.shared.frontmostApplication, app.bundleIdentifier == CodexBridge.bundleID else {
-            throw CodexBridge.Failure(message: "请回到目标 Codex 窗口后切换。")
+            throw CodexBridge.Failure(message: "请回到目标 Codex 窗口后切换。", code: "session_missing")
         }
         let pid = app.processIdentifier
         let window = try focusedWindow(pid)
@@ -51,21 +51,21 @@ struct CurrentThreadLink {
             let copy = NSPasteboardItem()
             for type in item.types {
                 guard let data = item.data(forType: type) else {
-                    throw CodexBridge.Failure(message: "剪贴板内容暂时无法保存，已停止自动识别。")
+                    throw CodexBridge.Failure(message: "剪贴板内容暂时无法保存，已停止自动识别。", code: "session_missing")
                 }
                 copy.setData(data, forType: type)
             }
             originals.append(copy)
         }
         guard pasteboard.changeCount == originalCount else {
-            throw CodexBridge.Failure(message: "剪贴板正在变化，请重试。")
+            throw CodexBridge.Failure(message: "剪贴板正在变化，请重试。", code: "session_missing")
         }
         let probe = CurrentThreadLink(id: "", window: window, pid: pid)
         try probe.checkWindow()
         guard let source = CGEventSource(stateID: .privateState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 37, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 37, keyDown: false) else {
-            throw CodexBridge.Failure(message: "无法调用 Codex 的复制会话链接命令。")
+            throw CodexBridge.Failure(message: "无法调用 Codex 的复制会话链接命令。", code: "session_missing")
         }
         down.flags = [.maskCommand, .maskAlternate]
         up.flags = [.maskCommand, .maskAlternate]
@@ -81,7 +81,7 @@ struct CurrentThreadLink {
                       UUID(uuidString: url.lastPathComponent) != nil,
                       url.query == nil, url.fragment == nil else {
                     // An unrelated copy belongs to the user; never overwrite it.
-                    throw CodexBridge.Failure(message: "未收到 Codex 会话链接。请确认「复制深层链接」快捷键为 ⌘⌥L。")
+                    throw CodexBridge.Failure(message: "未收到 Codex 会话链接。请确认「复制深层链接」快捷键为 ⌘⌥L。", code: "session_missing")
                 }
                 // Restore only if no newer clipboard owner has appeared.
                 if pasteboard.changeCount == receivedCount {
@@ -93,6 +93,6 @@ struct CurrentThreadLink {
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
-        throw CodexBridge.Failure(message: "Codex 未返回会话链接。请确认当前已打开会话，且「复制深层链接」快捷键为 ⌘⌥L。")
+        throw CodexBridge.Failure(message: "Codex 未返回会话链接。请确认当前已打开会话，且「复制深层链接」快捷键为 ⌘⌥L。", code: "session_missing")
     }
 }

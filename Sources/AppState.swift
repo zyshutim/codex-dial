@@ -35,8 +35,8 @@ struct HUDMessage: Equatable {
     let hotkeys = HotkeyManager()
     private let bridge = CodexBridge()
     private let store: PresetStore
-    private var timer: Timer?
-    private var refreshing = false
+    @Published private(set) var refreshing = false
+    private var queuedRefresh = false
     private var observation: NSObjectProtocol?
     private var loadFailed = false
     var onApply: (() -> Void)?
@@ -58,7 +58,6 @@ struct HUDMessage: Equatable {
             socketPath = "desktop"
             tripleTapEnabled = UserDefaults.standard.object(forKey: "optionTripleTap") as? Bool ?? true
         }
-        bridge.onChange = { [weak self] in if self?.targetID.isEmpty == false { self?.refresh() } }
         hotkeys.onPress = { [weak self] id in
             Task { @MainActor in self?.apply(id) }
         }
@@ -66,14 +65,11 @@ struct HUDMessage: Equatable {
     func start() {
         guard !preview else { return }
         observation = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.updateHotkeys(); if self?.targetID.isEmpty == false { self?.refresh() } }
-        }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in if self?.targetID.isEmpty == false { self?.refresh() } }
+            Task { @MainActor in self?.updateHotkeys() }
         }
         followWindow()
     }
-    func stop() { bridge.stop(); timer?.invalidate(); hotkeys.unregister(); recorder.stop(); if let observation { NSWorkspace.shared.notificationCenter.removeObserver(observation) } }
+    func stop() { bridge.stop(); hotkeys.unregister(); recorder.stop(); if let observation { NSWorkspace.shared.notificationCenter.removeObserver(observation) } }
     func model(_ selection: Selection?) -> ModelOption? { models.first { $0.id == selection?.modelID } }
     func label(_ selection: Selection?) -> String {
         guard let selection else { return "未设置" }
@@ -81,17 +77,19 @@ struct HUDMessage: Equatable {
     }
     var statusTitle: String {
         if targetID.isEmpty && reading.message == "自动跟随已开启" { return "Dial · 自动跟随" }
-        guard let selection = reading.selection else { return "Dial · \(trusted ? (reading.connected ? "档位未读取" : "待连接") : "待授权")" }
+        guard let selection = reading.selection else { return "Dial · \(reading.message)" }
         return (targetID.isEmpty ? "" : "固定 · ") + label(selection)
     }
     func refresh() {
-        guard !preview, !refreshing, !busy else { return }
+        guard !preview, !busy else { return }
+        if refreshing { queuedRefresh = true; return }
         let expectedRevision = revision
         refreshing = true
         bridge.read(models: models) { [weak self] result in
             guard let self else { return }
             self.refreshing = false
             if !self.busy && self.revision == expectedRevision { self.reading = result }
+            if self.queuedRefresh { self.queuedRefresh = false; self.refresh() }
         }
     }
     func reloadModels() { if !preview { models = Catalog.load() }; refresh() }
@@ -103,13 +101,14 @@ struct HUDMessage: Equatable {
         catch { self.error = "保存失败：\(error.localizedDescription)"; return false }
     }
     func saveShortcut(slot: Int) {
+        guard !tripleTapEnabled, recorder.slot == slot else { return }
         guard let pending = recorder.pending else { return }
         if let message = Validation.chord(pending, slot: slot, presets: presets) { recorder.error = message; return }
         if !preview && !hotkeys.available(pending) { recorder.error = "这个组合被系统或其他应用占用。"; return }
         var preset = presets[slot]; preset.hotkey = pending
         if save(preset) { recorder.stop() } else { recorder.error = error }
     }
-    func clearShortcut(_ slot: Int) { var p = presets[slot]; p.hotkey = nil; if save(p) { recorder.stop() } }
+    func clearShortcut(_ slot: Int) { guard !tripleTapEnabled else { return }; var p = presets[slot]; p.hotkey = nil; if save(p) { recorder.stop() } }
     func updateHotkeys() {
         guard !preview, shortcutsArmed, !showConnection, !showSettings, recorder.slot == nil, !busy,
               NSWorkspace.shared.frontmostApplication?.bundleIdentifier == CodexBridge.bundleID else {
@@ -131,11 +130,11 @@ struct HUDMessage: Equatable {
         updateHotkeys()
     }
     func setTripleTap(_ enabled: Bool) {
-        recorder.stop(); tripleTapEnabled = enabled
+        recorder.stop(); tripleTapEnabled = enabled; hotkeyFailures = []
         if !preview { UserDefaults.standard.set(enabled, forKey: "optionTripleTap") }
         updateHotkeys()
     }
-    func beginRecording(_ id: Int) { hotkeys.unregister(); recorder.begin(id) }
+    func beginRecording(_ id: Int) { guard !tripleTapEnabled else { return }; hotkeys.unregister(); recorder.begin(id) }
     func apply(_ id: Int) {
         guard !busy, (0..<10).contains(id) else { return }
         let preset = presets[id]
@@ -165,7 +164,7 @@ struct HUDMessage: Equatable {
                 self.reading = value
                 self.hud = HUDMessage(preset: preset, phase: .success, detail: "已更新会话的后续轮次设置")
             case .failure(let failure):
-                self.reading = Reading(selection: nil, message: "切换未完成", detail: failure.localizedDescription)
+                self.reading = CodexBridge.failureReading(failure)
                 self.hud = HUDMessage(preset: preset, phase: .failure, detail: failure.localizedDescription)
             }
             self.updateHotkeys()
@@ -173,18 +172,17 @@ struct HUDMessage: Equatable {
     }
     func followWindow() {
         guard !busy else { return }
-        revision += 1; targetID = ""; shortcutsArmed = true
+        revision += 1; queuedRefresh = false; targetID = ""; shortcutsArmed = true
         bridge.configure(path: "desktop", threadID: "", title: "")
         updateHotkeys()
-        reading = Reading(selection: nil, message: "自动跟随已开启", detail: "回到 Codex 按档位快捷键，将自动读取当前会话链接。")
+        reading = Reading(selection: nil, message: "自动跟随已开启", detail: "按快捷键时识别当前窗口的会话。平时不轮询，切换后显示最后确认的档位。")
     }
     func openPrivacySettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
     func connectAndList() {
         guard !listing, !busy else { return }
-        revision += 1; targets = []
-        reading = Reading(selection: nil, message: "连接中", detail: "正在读取服务中的会话")
+        targets = []
         socketPath = socketPath.trimmingCharacters(in: .whitespacesAndNewlines)
         bridge.configure(path: "desktop", threadID: targetID, title: targets.first(where: { $0.id == targetID })?.title ?? targetID)
         listing = true; connectionError = nil
@@ -195,7 +193,7 @@ struct HUDMessage: Equatable {
                 self.targets = targets
                 self.connectedSocketPath = self.socketPath
                 UserDefaults.standard.set(self.socketPath, forKey: "rpcSocketPath")
-                self.connectionError = targets.isEmpty ? "服务已连接，但没有已加载的会话。" : nil
+                self.connectionError = targets.isEmpty ? "本机还没有可显示的会话。" : nil
             case .failure(let error): self.connectionError = error.localizedDescription
             }
         }

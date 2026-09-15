@@ -3,7 +3,7 @@ import Carbon
 import AppKit
 
 enum SelfTests {
-    static func run() {
+    @MainActor static func run() {
         var count = 0
         func check(_ value: @autoclosure () -> Bool, _ name: String) {
             guard value() else { fputs("FAIL: \(name)\n", stderr); exit(1) }
@@ -12,6 +12,22 @@ enum SelfTests {
         var slots = Preset.emptySlots
         check(slots.map(\.digit).joined() == "1234567890", "ten slots ordered 1–0")
         check(Set(slots.compactMap { $0.hotkey?.code }).count == 10, "ten distinct physical digit keys")
+        let appState = AppState(preview: true)
+        let savedKeys = appState.presets.map(\.hotkey)
+        appState.beginRecording(0)
+        check(appState.recorder.slot == nil, "default mode cannot start custom recording")
+        appState.setTripleTap(false)
+        appState.beginRecording(0)
+        check(appState.recorder.slot == 0, "custom mode permits recording")
+        appState.recorder.pending = KeyChord.standard(2)
+        appState.setTripleTap(true)
+        check(appState.recorder.slot == nil && appState.recorder.pending == nil, "mode switch cancels unsaved recording")
+        appState.clearShortcut(0)
+        check(appState.presets.map(\.hotkey) == savedKeys, "inactive custom mode preserves saved bindings")
+        appState.setTripleTap(false)
+        check(appState.presets.map(\.hotkey) == savedKeys, "returning to custom restores saved bindings")
+        let connectionError = CodexBridge.failureReading(CodexBridge.Failure(message: "test", code: "timeout"))
+        check(connectionError.message == "Codex 响应超时", "timeout is distinguished from missing session")
         if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .shift], timestamp: 0, windowNumber: 0, context: nil, characters: "!", charactersIgnoringModifiers: "!", isARepeat: false, keyCode: 18) {
             check(KeyChord.from(event).display == "⌃⇧1", "Shift+1 displays physical digit rather than punctuation")
         } else { check(false, "key event fixture created") }

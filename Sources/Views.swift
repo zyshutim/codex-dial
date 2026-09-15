@@ -24,12 +24,13 @@ struct Keycap: View {
 
 struct DialButtonStyle: ButtonStyle {
     var prominent = false
+    @Environment(\.isEnabled) private var enabled
     func makeBody(configuration: Configuration) -> some View {
         configuration.label.font(.system(size: 12, weight: .medium))
             .padding(.horizontal, 13).padding(.vertical, 9)
             .foregroundStyle(prominent ? Color.white : Color.primary)
             .background(prominent ? Color(red: 0.73, green: 0.29, blue: 0.16) : DialStyle.quiet, in: RoundedRectangle(cornerRadius: 8))
-            .opacity(configuration.isPressed ? 0.75 : 1)
+            .opacity(!enabled ? 0.4 : configuration.isPressed ? 0.75 : 1)
     }
 }
 
@@ -54,7 +55,12 @@ struct RootView: View {
                 Text("Codex Dial").font(.system(size: 16, weight: .semibold))
                 Spacer()
                 if state.preview { Text("预览").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).padding(5).background(DialStyle.quiet, in: Capsule()) }
-                Button { state.reloadModels() } label: { Image(systemName: "arrow.clockwise").frame(width: 26, height: 26) }
+                Button { state.reloadModels() } label: {
+                    ZStack {
+                        if state.refreshing { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "arrow.clockwise") }
+                    }.frame(width: 30, height: 30).contentShape(Rectangle())
+                }.disabled(state.refreshing || state.busy)
                     .buttonStyle(.plain).help("重新读取模型与当前档位").accessibilityLabel("重新读取")
             }.padding(.horizontal, 22).padding(.top, 22).padding(.bottom, 17)
             currentCard.padding(.horizontal, 18)
@@ -108,7 +114,7 @@ struct RootView: View {
             Button("自动跟随当前窗口") { state.followWindow() }
                 .buttonStyle(DialButtonStyle(prominent: true)).disabled(state.busy)
             Button("打开辅助功能设置") { state.openPrivacySettings() }.buttonStyle(DialButtonStyle())
-            Text("切换时自动调用 Codex 的「复制深层链接」（⌘⌥L）来识别当前会话，并恢复剪贴板。模型和深度通过桌面内部接口切换。")
+            Text("每次切换时识别当前窗口的会话，平时不轮询。需要辅助功能权限，以及 Codex 默认的「复制深层链接」快捷键 ⌘⌥L。剪贴板内容会恢复。")
                 .font(.caption).foregroundStyle(.secondary)
             Button(state.listing ? "读取中…" : "刷新会话列表") { state.connectAndList() }
                 .buttonStyle(DialButtonStyle()).disabled(state.listing || state.busy)
@@ -129,7 +135,6 @@ struct RootView: View {
                                             Text(Date(timeIntervalSince1970: stamp), format: .dateTime.month().day().hour().minute())
                                         }
                                     }.font(.system(size: 10)).foregroundStyle(.secondary)
-                                    Text(target.id).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
                                 }
                                 Spacer()
                                 if state.targetID == target.id { Image(systemName: "checkmark") }
@@ -149,7 +154,7 @@ struct RootView: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 6) {
                 Circle().fill(state.reading.selection == nil ? Color.secondary : DialStyle.accent).frame(width: 5, height: 5)
-                Text(state.reading.message).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                Text(state.reading.message).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
                 if let active = state.presets.first(where: { $0.selection != nil && $0.selection == state.reading.selection }) {
                     Text("档位 \(active.digit)").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
@@ -163,8 +168,14 @@ struct RootView: View {
                         .padding(.horizontal, 10).padding(.vertical, 5).background(DialStyle.accent.opacity(0.08), in: Capsule())
                 }
             } else {
-                Text(state.reading.detail).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(3).fixedSize(horizontal: false, vertical: true)
-                Button("目标会话") { state.showConnection = true; state.updateHotkeys() }.buttonStyle(DialButtonStyle())
+                Text(state.reading.detail).font(.system(size: 12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button(state.refreshing ? "读取中…" : "重新读取") { state.refresh() }
+                        .buttonStyle(DialButtonStyle()).disabled(state.refreshing || state.busy)
+                    if state.reading.message == "需要辅助功能权限" {
+                        Button("打开设置") { state.openPrivacySettings() }.buttonStyle(DialButtonStyle())
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(16)
@@ -231,7 +242,8 @@ struct PresetEditor: View {
             HStack {
                 Text("编辑档位 \(preset.digit)").font(.system(size: 15, weight: .semibold))
                 Spacer()
-                if let key = preset.hotkey { Keycap(text: key.display) }
+                if state.tripleTapEnabled { Keycap(text: "⌥ " + String(repeating: preset.digit, count: 3)) }
+                else if let key = preset.hotkey { Keycap(text: key.display) }
             }.padding(.bottom, 20)
             Text("名称").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).padding(.bottom, 7).onTapGesture { nameFocused = true }
             TextField("例如：深入思考", text: $preset.name).textFieldStyle(.roundedBorder).focused($nameFocused)
@@ -329,18 +341,49 @@ struct ShortcutSettings: View {
             HStack {
                 Button {
                     recorder.stop(); state.showSettings = false; state.updateHotkeys()
-                } label: { Image(systemName: "chevron.left").frame(width: 28, height: 28) }.buttonStyle(.plain).accessibilityLabel("返回档位")
+                } label: { Image(systemName: "chevron.left").frame(width: 30, height: 30).contentShape(Rectangle()) }
+                    .buttonStyle(.plain).accessibilityLabel("返回档位")
                 Text("快捷键").font(.system(size: 17, weight: .semibold))
                 Spacer()
-                Image(systemName: "keyboard").font(.system(size: 21)).foregroundStyle(.secondary)
-            }.padding(.bottom, 14)
-            Toggle("Option + 数字连按三次", isOn: Binding(get: { state.tripleTapEnabled }, set: { state.setTripleTap($0) }))
-                .font(.system(size: 12)).padding(.bottom, 8)
-            Text(state.tripleTapEnabled ? "按住 ⌥，0.9 秒内连按三次同一数字。下面的单次组合键暂不生效，关闭此开关即可恢复。" : "当前使用下方保存的单次组合键。")
-                .font(.system(size: 11)).foregroundStyle(.secondary).padding(.bottom, 12)
-            Text("点击按键框，按下新组合。").font(.system(size: 13, weight: .medium)).padding(.bottom, 5)
-            Text("按键会实时显示，确认保存后生效。\n只在 Codex 位于前台时响应。Esc 取消录入。")
-                .font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(3).padding(.bottom, 18)
+            }.padding(.bottom, 20)
+            Text("选择一种切换方式").font(.system(size: 12, weight: .medium)).padding(.bottom, 10)
+            Picker("切换方式", selection: Binding(get: { state.tripleTapEnabled }, set: { state.setTripleTap($0) })) {
+                Text("⌥ 数字三连击").tag(true)
+                Text("自定义").tag(false)
+            }.pickerStyle(.segmented).labelsHidden().padding(.bottom, 20)
+
+            if state.tripleTapEnabled {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("按住 Option，轻点三次数字").font(.system(size: 14, weight: .medium))
+                    Text("0.9 秒内连按同一数字，对应档位立即切换。\n例如 ⌥ + 111 切到档位 1，⌥ + 000 切到档位 0。")
+                        .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(4)
+                }.padding(.bottom, 22)
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 9) {
+                    ForEach(state.presets) { preset in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Keycap(text: "⌥ " + String(repeating: preset.digit, count: 3))
+                            Text(preset.title).font(.system(size: 12)).foregroundStyle(preset.selection == nil ? .secondary : .primary).lineLimit(1)
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(13)
+                            .background(DialStyle.quiet, in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                Spacer(minLength: 20)
+            } else {
+                Text("点击按键框，按下新组合").font(.system(size: 14, weight: .medium)).padding(.bottom, 6)
+                Text("按键会实时显示，确认保存后生效。Esc 取消录入。")
+                    .font(.system(size: 12)).foregroundStyle(.secondary).lineSpacing(3).padding(.bottom, 14)
+                customBindings.frame(minHeight: 0, maxHeight: .infinity)
+                Text("默认 ⌃⇧ + 1–0。自动检查重复和系统占用。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 12)
+            }
+            Divider().padding(.vertical, 16)
+            Label("只在 Codex 前台生效，两种方式互不叠加。", systemImage: "info.circle")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+        }.padding(22).tint(DialStyle.accent)
+            .onDisappear { recorder.stop() }
+    }
+    private var customBindings: some View {
+        ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 4) {
                     ForEach(state.presets) { preset in
@@ -351,7 +394,7 @@ struct ShortcutSettings: View {
                                 Spacer(minLength: 4)
                                 Button { state.beginRecording(preset.id) } label: {
                                     Text(recordingText(preset)).font(.system(size: 13, weight: .medium, design: .monospaced))
-                                        .frame(minWidth: 103, minHeight: 34)
+                                        .frame(minWidth: 103, minHeight: 36)
                                         .foregroundStyle(recorder.slot == preset.id ? DialStyle.accent : Color.primary)
                                         .background(recorder.slot == preset.id ? DialStyle.accent.opacity(0.06) : DialStyle.quiet, in: RoundedRectangle(cornerRadius: 7))
                                         .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(recorder.slot == preset.id ? DialStyle.accent.opacity(0.7) : DialStyle.border, lineWidth: recorder.slot == preset.id ? 1.5 : 0.5))
@@ -360,23 +403,22 @@ struct ShortcutSettings: View {
                             if recorder.slot == preset.id {
                                 if let error = recorder.error { InlineError(message: error) }
                                 HStack(spacing: 8) {
-                                    Button("清除绑定") { state.clearShortcut(preset.id) }.buttonStyle(.plain).font(.system(size: 10)).foregroundStyle(.secondary)
+                                    Button("清除绑定") { state.clearShortcut(preset.id) }.buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
                                     Spacer()
                                     Button("取消") { recorder.stop() }.buttonStyle(DialButtonStyle())
                                     Button("确认保存") { state.saveShortcut(slot: preset.id) }.buttonStyle(DialButtonStyle(prominent: true)).disabled(recorder.pending == nil)
                                 }
                             }
-                        }.padding(.horizontal, 10).padding(.vertical, 4).background(recorder.slot == preset.id ? DialStyle.quiet : .clear, in: RoundedRectangle(cornerRadius: 10))
+                        }.padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(recorder.slot == preset.id ? DialStyle.quiet : .clear, in: RoundedRectangle(cornerRadius: 10))
+                            .id(preset.id)
                     }
                 }
             }.scrollIndicators(.hidden)
-            Divider().padding(.vertical, 14)
-            HStack(alignment: .top, spacing: 7) {
-                Image(systemName: "info.circle")
-                Text("默认 ⌃⇧ + 1–0。会检查重复与系统占用；Codex 自定义快捷键也需避免重叠。")
-            }.font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        }.padding(22)
-        .onDisappear { recorder.stop() }
+                .onChange(of: recorder.slot) { _, slot in
+                    if let slot { proxy.scrollTo(slot) }
+                }
+        }
     }
     private func recordingText(_ preset: Preset) -> String {
         guard recorder.slot == preset.id else { return preset.hotkey?.display ?? "未绑定" }

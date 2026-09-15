@@ -102,7 +102,7 @@ final class HUDPanel: NSPanel {
         if message.phase != .switching {
             let work = DispatchWorkItem { [weak panel] in panel?.orderOut(nil) }
             hideWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + (message.phase == .failure ? 1.8 : 0.75), execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (message.phase == .failure ? 4 : 0.75), execute: work)
         }
     }
     private func renderArtifacts() {
@@ -113,17 +113,29 @@ final class HUDPanel: NSPanel {
             try render(RootView(state: state), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("01-presets.png"))
             state.showSettings = true
             try render(ShortcutSettings(state: state, recorder: state.recorder).frame(width: 420, height: 730).background(.regularMaterial), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("02-shortcuts.png"))
+            state.setTripleTap(false)
+            try render(ShortcutSettings(state: state, recorder: state.recorder).frame(width: 420, height: 730).background(.regularMaterial), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("05-custom-shortcuts.png"))
+            state.beginRecording(0)
+            state.recorder.pending = KeyChord.standard(0)
+            try render(ShortcutSettings(state: state, recorder: state.recorder).frame(width: 420, height: 730).background(.regularMaterial), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("06-recording-dark.png"), dark: true)
+            state.recorder.stop()
             try render(PresetEditor(state: state, preset: state.presets[2], dismiss: {}), size: NSSize(width: 370, height: 535), to: directory.appendingPathComponent("03-editor.png"))
             let message = HUDMessage(preset: state.presets[2], phase: .success, detail: "预览切换 · 未改变 Codex")
             try render(SwitchHUD(message: message, model: state.model(message.preset.selection)), size: NSSize(width: 265, height: 112), to: directory.appendingPathComponent("04-switch.png"))
-            print("Rendered four UI previews to \(directory.path)")
+            state.showSettings = false
+            state.reading = CodexBridge.failureReading(CodexBridge.Failure(message: "Codex 设置接口已变化，无法确认参数兼容，尚未更改会话。", code: "incompatible"))
+            try render(RootView(state: state), size: NSSize(width: 420, height: 730), to: directory.appendingPathComponent("07-error-dark.png"), dark: true)
+            print("Rendered seven UI previews to \(directory.path)")
         } catch { fputs("Render failed: \(error)\n", stderr) }
     }
-    private func render<V: View>(_ view: V, size: NSSize, to url: URL) throws {
-        let host = NSHostingView(rootView: view.environment(\.colorScheme, .light))
+    private func render<V: View>(_ view: V, size: NSSize, to url: URL, dark: Bool = false) throws {
+        let host = NSHostingView(rootView: view.environment(\.colorScheme, dark ? .dark : .light))
+        host.sizingOptions = []
         host.frame = NSRect(origin: .zero, size: size)
         let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        window.contentView = host; window.appearance = NSAppearance(named: .aqua)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = host; window.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         host.layoutSubtreeIfNeeded()
         RunLoop.current.run(until: Date().addingTimeInterval(0.08))
         guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { throw CocoaError(.fileWriteUnknown) }

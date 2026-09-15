@@ -1,5 +1,6 @@
 """Desktop IPC adapter. Only identity, state following and model settings methods."""
 import asyncio,json,os,pathlib,sqlite3,stat,struct,sys,uuid,time,datetime
+from desktop_protocol import DialError, Protocol, UPDATE, OWNER, FOLLOW
 CODEX_DIR=pathlib.Path(os.environ.get('CODEX_HOME',str(pathlib.Path.home()/'.codex')))
 _metadata_cache = None
 _metadata_time = 0
@@ -75,138 +76,256 @@ def resolve_title(p):
                 matches[tid]={'id':tid,'title':title}
     if len(matches)!=1:raise RuntimeError('当前项标题未匹配到唯一会话，暂不切换。')
     return next(iter(matches.values()))
-class ConnectionFailure(RuntimeError):pass
+class ConnectionFailure(DialError):
+    def __init__(self, message):
+        super().__init__('disconnected', message)
+
+
 class Desktop:
-    def __init__(self):self.pending={};self.client='initializing-client';self.states={};self.owner=None;self.following=None;self.read_error=None
+    def __init__(self):
+        self.protocol = Protocol()
+        self.pending = {}
+        self.w = self.task = None
+        self.client = 'initializing-client'
+        self.states = {}
+        self.owner = self.following = self.read_error = None
+
     async def connect(self):
-        self.client='initializing-client';self.read_error=None;self.owner=None;self.following=None;self.states.clear()
-        paths=[CODEX_DIR/'ipc/ipc.sock',pathlib.Path('/private/tmp/codex-ipc')/('ipc-'+str(os.getuid())+'.sock')]
-        failures=[]
-        for p in paths:
+        paths = [CODEX_DIR / 'ipc/ipc.sock',
+                 pathlib.Path('/private/tmp/codex-ipc') / ('ipc-' + str(os.getuid()) + '.sock')]
+        for path in paths:
             try:
-                s=p.stat()
-                if not stat.S_ISSOCK(s.st_mode) or s.st_uid!=os.getuid():continue
-                self.r,self.w=await asyncio.wait_for(asyncio.open_unix_connection(str(p)),2);break
-            except (OSError,asyncio.TimeoutError) as e:failures.append(str(p)+': '+str(e))
-        else:raise RuntimeError('连接地址不可用。'+ '; '.join(failures))
-        self.task=asyncio.create_task(self.read())
-        try:r=await self.request('initialize',{'clientType':'codex-dial'},version=0)
-        except Exception as e:raise RuntimeError('IPC 注册失败：'+(str(e) or type(e).__name__))
-        self.client=r['result']['clientId']
-    async def send(self,m):
-        b=json.dumps(m).encode();self.w.write(struct.pack('<I',len(b))+b);await self.w.drain()
-    async def request(self,method,params,target=None,version=1):
-        if self.read_error is not None:raise ConnectionFailure('桌面连接已断开：'+str(self.read_error))
-        rid=str(uuid.uuid4());f=asyncio.get_running_loop().create_future();self.pending[rid]=f
-        m={'type':'request','requestId':rid,'sourceClientId':self.client,'method':method,'params':params,'version':version,'timeoutMs':5000}
-        if target:m['targetClientId']=target
+                info = path.stat()
+                if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+                self.r, self.w = await asyncio.wait_for(asyncio.open_unix_connection(str(path)), 2)
+                self.task = asyncio.create_task(self.read())
+                reply = await self.request('initialize', {'clientType': 'codex-dial'})
+                self.client = reply['result']['clientId']
+                return
+            except (OSError, asyncio.TimeoutError, DialError):
+                await self.close()
+        raise ConnectionFailure('无法连接 Codex。请确认客户端已启动，完成更新后再重试。')
+
+    async def send(self, message):
+        if self.read_error:
+            raise self.read_error
+        if self.w is None or self.w.is_closing():
+            raise ConnectionFailure('Codex 连接已断开。')
+        data = json.dumps(message).encode()
         try:
-            await self.send(m)
-            r=await asyncio.wait_for(f,6)
-        except asyncio.TimeoutError as e:
-            raise ConnectionFailure('桌面请求超时：'+method) from e
-        except (OSError,asyncio.IncompleteReadError) as e:
-            raise ConnectionFailure('桌面连接中断：'+method) from e
-        finally:self.pending.pop(rid,None)
-        if r.get('resultType')!='success':raise RuntimeError('桌面接口未完成请求：'+str(r.get('error','unknown')))
-        return r
-    async def broadcast(self,method,params,target):
-        await self.send({'type':'broadcast','method':method,'sourceClientId':self.client,'version':1,'params':params,'targetClientIds':[target]})
+            self.w.write(struct.pack('<I', len(data)) + data)
+            await asyncio.wait_for(self.w.drain(), 1)
+        except (OSError, asyncio.TimeoutError) as error:
+            raise ConnectionFailure('Codex 连接已断开。') from error
+
+    async def request(self, method, params, target=None):
+        version = self.protocol.version(method)
+        rid = str(uuid.uuid4())
+        future = asyncio.get_running_loop().create_future()
+        self.pending[rid] = future
+        message = dict(type='request', requestId=rid, sourceClientId=self.client,
+                       method=method, params=params, version=version, timeoutMs=4000)
+        if target:
+            message['targetClientId'] = target
+        try:
+            await self.send(message)
+            reply = await asyncio.wait_for(future, 5)
+        except asyncio.TimeoutError as error:
+            raise DialError('timeout', 'Codex 响应超时，请稍后重新读取。') from error
+        finally:
+            self.pending.pop(rid, None)
+            if not future.done():
+                future.cancel()
+        if reply.get('resultType') != 'success':
+            detail = str(reply.get('error', 'unknown'))
+            if 'version' in detail:
+                raise DialError('incompatible', 'Codex 接口版本不兼容，请完成客户端更新后重试。')
+            if any(key in detail for key in ('no-client-found', 'client-not-found', 'client-disconnected')):
+                raise DialError('owner_missing', '未找到负责此会话的 Codex 连接，请打开目标会话后重试。')
+            if 'timeout' in detail.lower():
+                raise DialError('timeout', 'Codex 响应超时，请稍后重新读取。')
+            raise DialError('request_failed', 'Codex 未完成请求：' + detail)
+        return reply
+
+    async def broadcast(self, method, params, target):
+        await self.send(dict(type='broadcast', method=method, sourceClientId=self.client,
+                            version=self.protocol.version(method), params=params, targetClientIds=[target]))
+
     async def read(self):
         try:
             while True:
-                n=struct.unpack('<I',await self.r.readexactly(4))[0]
-                if n>64*1024*1024:raise RuntimeError('桌面状态过大')
-                m=json.loads(await self.r.readexactly(n))
-                if m.get('type')=='response':
-                    f=self.pending.get(m.get('requestId'))
-                    if f and not f.done():f.set_result(m)
-                elif m.get('type')=='client-discovery-request':
-                    await self.send({'type':'client-discovery-response','requestId':m['requestId'],'response':{'canHandle':False}})
-                elif m.get('type')=='broadcast' and m.get('method')=='thread-stream-state-changed':
-                    p=m.get('params',{});tid=p.get('conversationId');change=p.get('change',{})
-                    if tid!=self.following or m.get('sourceClientId')!=self.owner:continue
-                    if change.get('type')=='snapshot':
-                        state=change.get('conversationState',{});settings=state.get('latestThreadSettings') or {}
-                        self.states[tid]={'model':settings.get('model',state.get('latestModel')),'reasoningEffort':settings.get('effort',state.get('latestReasoningEffort'))}
-                    elif change.get('type')=='patches':
-                        state=self.states.get(tid)
-                        if state is None:continue
-                        for patch in change.get('patches',[]):
-                            path=patch.get('path',[])
-                            if isinstance(path,str):path=path.strip('/').split('/')
-                            v=patch.get('value')
-                            if path==['latestModel'] or path==['latestThreadSettings','model']:state['model']=v
-                            elif path==['latestReasoningEffort'] or path==['latestThreadSettings','effort']:state['reasoningEffort']=v
-                            elif path==['latestThreadSettings'] and isinstance(v,dict):state.update(model=v.get('model'),reasoningEffort=v.get('effort'))
+                length = struct.unpack('<I', await self.r.readexactly(4))[0]
+                if length > 256 * 1024 * 1024:
+                    raise DialError('incompatible', 'Codex 返回的会话状态超出可读取范围。')
+                message = json.loads(await self.r.readexactly(length))
+                if message.get('type') == 'response':
+                    future = self.pending.get(message.get('requestId'))
+                    if future and not future.done():
+                        future.set_result(message)
+                elif message.get('type') == 'client-discovery-request':
+                    await self.send(dict(type='client-discovery-response', requestId=message['requestId'],
+                                         response={'canHandle': False}))
+                elif message.get('type') == 'broadcast' and message.get('method') == 'thread-stream-state-changed':
+                    params = message.get('params', {})
+                    tid = params.get('conversationId')
+                    if tid != self.following or message.get('sourceClientId') != self.owner:
+                        continue
+                    change = params.get('change', {})
+                    if change.get('type') == 'snapshot':
+                        state = change.get('conversationState', {})
+                        settings = state.get('latestThreadSettings') or {}
+                        self.states[tid] = dict(model=settings.get('model', state.get('latestModel')),
+                                                reasoningEffort=settings.get('effort', state.get('latestReasoningEffort')))
+                    elif change.get('type') == 'patches':
+                        state = self.states.get(tid)
+                        if state is None:
+                            continue
+                        for patch in change.get('patches', []):
+                            path = patch.get('path', [])
+                            if isinstance(path, str):
+                                path = path.strip('/').split('/')
+                            value = patch.get('value')
+                            if path in (['latestModel'], ['latestThreadSettings', 'model']):
+                                state['model'] = value
+                            elif path in (['latestReasoningEffort'], ['latestThreadSettings', 'effort']):
+                                state['reasoningEffort'] = value
+                            elif path == ['latestThreadSettings'] and isinstance(value, dict):
+                                state.update(model=value.get('model'), reasoningEffort=value.get('effort'))
         except Exception as error:
-            self.read_error=error
+            self.read_error = error if isinstance(error, DialError) else ConnectionFailure('Codex 接收连接中断。')
             self.states.clear()
-            for f in self.pending.values():
-                if not f.done():f.set_exception(ConnectionFailure('桌面接收连接中断：'+type(error).__name__))
-    async def state(self,tid):
-        r=await self.request('thread-owner-discovery',{'hostId':'local','conversationId':tid});owner=r['handledByClientId']
-        if self.following!=tid or self.owner!=owner or tid not in self.states:
-            if self.following:
-                await self.broadcast('thread-stream-following-changed',{'hostId':'local','conversationId':self.following,'following':False},self.owner)
-            self.following=tid;self.owner=owner;self.states.clear()
-            await self.broadcast('thread-stream-following-changed',{'hostId':'local','conversationId':tid,'following':True},owner)
+            for future in self.pending.values():
+                if not future.done():
+                    future.set_exception(self.read_error)
+
+    async def state(self, tid):
+        reply = await self.request(OWNER, {'hostId': 'local', 'conversationId': tid})
+        self.owner = reply.get('handledByClientId')
+        if not self.owner:
+            raise DialError('owner_missing', '未找到负责此会话的 Codex 连接。')
+        self.following = tid
+        await self.broadcast(FOLLOW, {'hostId': 'local', 'conversationId': tid, 'following': True}, self.owner)
         for _ in range(40):
-            if tid in self.states:return self.states[tid]
+            if self.read_error:
+                raise self.read_error
+            state = self.states.get(tid)
+            if state is not None:
+                if not all(isinstance(state.get(key), str) and state[key] for key in ('model', 'reasoningEffort')):
+                    raise DialError('incompatible', 'Codex 返回的档位信息格式无法识别，尚未更改会话。')
+                return state
             await asyncio.sleep(.05)
-        raise RuntimeError('已找到会话，但桌面未返回档位状态。请切回该会话后重试。')
-    async def handle(self,method,p):
-        if method=='desktop/list':
+        raise DialError('state_timeout', '已找到会话，但未收到档位信息。请回到目标会话后重新读取。')
+
+    async def prepare(self, tid):
+        for attempt in range(2):
+            try:
+                await self.connect()
+                return await self.state(tid)
+            except DialError as error:
+                await self.close()
+                if attempt or error.code not in ('disconnected', 'timeout', 'state_timeout', 'owner_missing'):
+                    raise
+                print(json.dumps({'method': 'transport/stage', 'stage': '重新连接当前会话'}), flush=True)
+
+    async def handle(self, method, params):
+        if method == 'desktop/list':
             global _metadata_time
-            _metadata_time=0
-            return {'data':await asyncio.to_thread(threads)}
-        if method=='desktop/resolve':
-            if p.get('id'):return {'id':p['id'],'title':p.get('title') or p['id']}
-            return await asyncio.to_thread(resolve_title,p)
-        tid=p['threadId']
-        if method=='thread/read':
-            try:state=await self.state(tid)
-            except ConnectionFailure:
-                # Only retry reads. A timed-out settings update may already have applied.
-                print(json.dumps({'method':'transport/stage','stage':'读取连接失效，自动重连'}),flush=True)
-                await self.close();await self.connect()
-                state=await self.state(tid)
-            return {'thread':dict(state,id=tid,status={'type':'idle'})}
-        if method=='thread/settings/update':
-            await self.state(tid)
-            await self.request('thread-follower-update-thread-settings',{'conversationId':tid,'threadSettings':{'model':p['model'],'effort':p['effort']}},target=self.owner)
+            _metadata_time = 0
+            return {'data': await asyncio.to_thread(threads)}
+        if method == 'desktop/resolve':
+            if params.get('id'):
+                return {'id': params['id'], 'title': params.get('title') or params['id']}
+            return await asyncio.to_thread(resolve_title, params)
+        if method not in ('thread/read', 'thread/settings/update'):
+            raise DialError('request_failed', '不支持的请求。')
+        tid = params.get('threadId', '')
+        try:
+            uuid.UUID(tid)
+        except (ValueError, TypeError, AttributeError):
+            raise DialError('session_missing', '未识别到目标会话，请回到 Codex 会话后重新读取。')
+        try:
+            try:
+                await asyncio.to_thread(self.protocol.refresh)
+            except DialError:
+                raise
+            except (OSError, ValueError, KeyError, TypeError, struct.error) as error:
+                raise DialError('incompatible', '无法读取 Codex 接口信息，请完成客户端更新后重试。') from error
+            if method == 'thread/settings/update':
+                self.protocol.check_write()
+                if not isinstance(params.get('model'), str) or not params['model'] or params.get('effort') not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
+                    raise DialError('request_failed', '档位参数无效，尚未更改会话。')
+            state = await self.prepare(tid)
+            if method == 'thread/read':
+                return {'thread': dict(state, id=tid, status={'type': 'idle'}),
+                        'protocolVersion': self.protocol.version(UPDATE)}
+            try:
+                reply = await self.request(UPDATE, {'conversationId': tid, 'threadSettings':
+                                           {'model': params['model'], 'effort': params['effort']}}, target=self.owner)
+            except DialError as error:
+                if error.code in ('timeout', 'disconnected'):
+                    raise DialError('unconfirmed', '未收到切换确认，设置可能已生效。请重新读取；不会重复发送切换。') from error
+                raise
+            if reply.get('result', {}).get('applied') is False:
+                raise DialError('not_applied', 'Codex 未应用这个档位，请重新读取后重试。')
             for _ in range(40):
-                state=self.states.get(tid,{})
-                if state.get('model')==p['model'] and state.get('reasoningEffort')==p['effort']:return {}
+                actual = self.states.get(tid, {})
+                if actual.get('model') == params['model'] and actual.get('reasoningEffort') == params['effort']:
+                    return {}
+                if self.read_error:
+                    break
                 await asyncio.sleep(.05)
-            raise RuntimeError('桌面已接受设置，但尚未收到一致的状态回显；请重新读取。')
-        raise RuntimeError('Unsupported method')
+            raise DialError('unconfirmed', '已发送切换，但尚未确认新的档位。请重新读取；不会重复发送切换。')
+        finally:
+            await self.close()
+
     async def close(self):
-        if self.following:
-            try:await self.broadcast('thread-stream-following-changed',{'hostId':'local','conversationId':self.following,'following':False},self.owner)
-            except:pass
-        self.w.close()
-        self.task.cancel()
-        try:await self.task
-        except (Exception,asyncio.CancelledError):pass
-        try:await asyncio.wait_for(self.w.wait_closed(),.5)
-        except (Exception,asyncio.CancelledError):pass
+        if self.following and self.w and not self.w.is_closing() and not self.read_error:
+            try:
+                await self.broadcast(FOLLOW, {'hostId': 'local', 'conversationId': self.following, 'following': False}, self.owner)
+            except Exception:
+                pass
+        if self.w:
+            self.w.close()
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except (Exception, asyncio.CancelledError):
+                pass
+        if self.w:
+            try:
+                await asyncio.wait_for(self.w.wait_closed(), .5)
+            except (Exception, asyncio.CancelledError):
+                pass
+        self.w = self.task = None
+        self.client = 'initializing-client'
+        self.owner = self.following = self.read_error = None
+        self.states.clear()
+
+
 async def main():
-    d=Desktop()
+    desktop = Desktop()
     try:
-        print(json.dumps({'method':'transport/stage','stage':'IPC 连接及注册'}),flush=True)
-        await d.connect()
         while True:
-            line=await asyncio.to_thread(sys.stdin.readline)
-            if not line:break
-            r=json.loads(line)
-            print(json.dumps({'method':'transport/stage','stage':r['method']}),flush=True)
-            try:result={'id':r['id'],'result':await d.handle(r['method'],r['params'])}
-            except Exception as e:result={'id':r['id'],'error':{'message':str(e) or type(e).__name__}}
-            print(json.dumps(result),flush=True)
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if not line:
+                break
+            request = json.loads(line)
+            print(json.dumps({'method': 'transport/stage', 'stage': request['method']}), flush=True)
+            try:
+                reply = {'id': request['id'], 'result': await desktop.handle(request['method'], request['params'])}
+            except Exception as error:
+                reply = {'id': request['id'], 'error': {'code': getattr(error, 'code', 'request_failed'),
+                                                       'message': str(error) or type(error).__name__}}
+            print(json.dumps(reply), flush=True)
     finally:
-        if hasattr(d,'w'):
-            try:await d.close()
-            except Exception:pass
-try:asyncio.run(main())
-except Exception as e:print(str(e) or type(e).__name__,file=sys.stderr,flush=True);sys.exit(1)
+        await desktop.close()
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except Exception as error:
+        print(str(error) or type(error).__name__, file=sys.stderr, flush=True)
+        sys.exit(1)
