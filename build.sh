@@ -9,6 +9,9 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BUILD_DIR/release/CodexDial" "$APP_DIR/Contents/MacOS/CodexDial"
 cp "$SOURCE_DIR/Resources/"*.py "$APP_DIR/Contents/Resources/"
 cp "$SOURCE_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/"
+# Release debug symbols can disclose the publisher's local build directories.
+# Strip before signing; changing a signed executable would invalidate its signature.
+/usr/bin/strip -S "$APP_DIR/Contents/MacOS/CodexDial"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

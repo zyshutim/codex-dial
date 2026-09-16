@@ -11,3 +11,14 @@ __pycache__/
 *.key
 *.pem
 keychain-password
+.env
+.env.*
+!.env.example
+auth.json
+presets.json
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.jsonl
+*.log
