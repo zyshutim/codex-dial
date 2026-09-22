@@ -228,6 +228,33 @@ class Desktop:
                     raise
                 print(json.dumps({'method': 'transport/stage', 'stage': '重新连接当前会话'}), flush=True)
 
+    async def apply_settings(self, tid, model, effort):
+        """Apply once from the owner's acknowledgement without subscribing to a full thread snapshot."""
+        self.protocol.check_write()
+        for attempt in range(2):
+            try:
+                await self.connect()
+                reply = await self.request(OWNER, {'hostId': 'local', 'conversationId': tid})
+                owner = reply.get('handledByClientId')
+                if not owner:
+                    raise DialError('owner_missing', '未找到负责此会话的 Codex 连接。')
+                try:
+                    updated = await self.request(UPDATE, {'conversationId': tid, 'threadSettings':
+                                                 {'model': model, 'effort': effort}}, target=owner)
+                except DialError as error:
+                    if error.code in ('timeout', 'disconnected'):
+                        raise DialError('unconfirmed', '未收到切换确认，设置可能已生效。请重新读取；不会重复发送切换。') from error
+                    raise
+                if updated.get('result', {}).get('applied') is False:
+                    raise DialError('not_applied', 'Codex 未应用这个档位，请重新读取后重试。')
+                return {'applied': True}
+            except DialError as error:
+                await self.close()
+                # Retrying is safe only before the write. Never replay an update whose result is uncertain.
+                if attempt or error.code not in ('disconnected', 'timeout', 'owner_missing'):
+                    raise
+                print(json.dumps({'method': 'transport/stage', 'stage': '重新连接当前会话'}), flush=True)
+
     async def handle(self, method, params):
         if method == 'desktop/list':
             global _metadata_time
@@ -237,7 +264,7 @@ class Desktop:
             if params.get('id'):
                 return {'id': params['id'], 'title': params.get('title') or params['id']}
             return await asyncio.to_thread(resolve_title, params)
-        if method not in ('thread/read', 'thread/settings/update'):
+        if method not in ('thread/read', 'thread/settings/update', 'thread/settings/apply'):
             raise DialError('request_failed', '不支持的请求。')
         tid = params.get('threadId', '')
         try:
@@ -251,10 +278,12 @@ class Desktop:
                 raise
             except (OSError, ValueError, KeyError, TypeError, struct.error) as error:
                 raise DialError('incompatible', '无法读取 Codex 接口信息，请完成客户端更新后重试。') from error
-            if method == 'thread/settings/update':
+            if method in ('thread/settings/update', 'thread/settings/apply'):
                 self.protocol.check_write()
                 if not isinstance(params.get('model'), str) or not params['model'] or params.get('effort') not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
                     raise DialError('request_failed', '档位参数无效，尚未更改会话。')
+            if method == 'thread/settings/apply':
+                return await self.apply_settings(tid, params['model'], params['effort'])
             state = await self.prepare(tid)
             if method == 'thread/read':
                 return {'thread': dict(state, id=tid, status={'type': 'idle'}),

@@ -40,6 +40,8 @@ final class CodexBridge {
     private var resolvedThreadID = ""
     private var threadID = ""
     private var title = ""
+    private var confirmedThreadID = ""
+    private var confirmedSelection: Selection?
     private var generation = 0
     private var nextID = 0
     private let condition = NSCondition()
@@ -143,7 +145,9 @@ final class CodexBridge {
         guard let model = thread["model"] as? String, let effort = thread["reasoningEffort"] as? String, let value = Effort(rawValue: effort) else {
             throw Failure(message: "Codex 未返回可识别的模型与思考深度，尚未更改会话。", code: "incompatible")
         }
-        return Reading(selection: Selection(modelID: model, effort: value), message: "\(threadID.isEmpty ? "上次读取 · 当前窗口" : "固定会话 · " + title)", detail: "上次确认的后续轮次档位。每次切换时重新识别目标。", connected: true)
+        let selection = Selection(modelID: model, effort: value)
+        confirmedThreadID = resolvedThreadID; confirmedSelection = selection
+        return Reading(selection: selection, message: "\(threadID.isEmpty ? "上次读取 · 当前窗口" : "固定会话 · " + title)", detail: "上次确认的后续轮次档位。每次切换时重新识别目标。", connected: true)
     }
     func list(completion: @escaping (Result<[RPCTarget], Error>) -> Void) {
         queue.async {
@@ -186,9 +190,22 @@ final class CodexBridge {
                 let automatic = self.path == "desktop" && self.threadID.isEmpty
                 let focus = automatic ? try CurrentThreadLink.capture() : nil
                 if let focus { self.resolvedThreadID = focus.id; self.title = String(focus.id.prefix(8)) }
+                let target = self.resolvedThreadID
+                guard !target.isEmpty else { throw Failure(message: "请打开目标 Codex 会话后重新读取。", code: "session_missing") }
+                if self.path == "desktop" {
+                    if self.confirmedThreadID == target, let previous = self.confirmedSelection {
+                        let reading = Reading(selection: previous, message: "上次确认 · 当前会话", detail: "使用本地已确认档位。", connected: true)
+                        DispatchQueue.main.async { prepared?(reading) }
+                    }
+                    if let focus {
+                        try focus.checkWindow()
+                    }
+                    _ = try self.request("thread/settings/apply", ["threadId": target, "model": selection.modelID, "effort": selection.effort.rawValue])
+                    self.confirmedThreadID = target; self.confirmedSelection = selection
+                    return Reading(selection: selection, message: "当前会话", detail: "Codex 已确认后续轮次档位。", connected: true)
+                }
                 let previous = try self.current(resolveActive: false)
                 DispatchQueue.main.async { prepared?(previous) }
-                let target = self.resolvedThreadID
                 if let focus {
                     // Re-resolve after IPC loading: navigation within the same window
                     // must not silently switch the previously viewed conversation.

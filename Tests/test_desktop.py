@@ -160,7 +160,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         return await self.desktop.handle('thread/read', {'threadId': tid})
 
     async def update(self):
-        return await self.desktop.handle('thread/settings/update', {'threadId': '00000000-0000-0000-0000-000000000001', 'model': 'model-b', 'effort': 'high'})
+        return await self.desktop.handle('thread/settings/apply', {'threadId': '00000000-0000-0000-0000-000000000001', 'model': 'model-b', 'effort': 'high'})
 
     async def test_a_b_a_rediscovery_and_no_idle_connection(self):
         for digit in ('1', '2', '1'):
@@ -187,6 +187,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updates[0]['version'], 2)
         self.assertEqual(updates[0]['targetClientId'], 'owner-1')
         self.assertIsNone(self.desktop.w)
+        self.assertEqual([m for m in self.messages if m.get('method') == FOLLOW], [])
 
     async def test_update_timeout_is_not_replayed(self):
         self.update_error = 'timeout'
